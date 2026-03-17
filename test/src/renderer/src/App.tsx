@@ -1,13 +1,33 @@
-import { useState, useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import audioFile from './assets/audio/audio.mp3'
+import {
+  calculateRms,
+  createJsmpegPlayer,
+  destroyPlayer,
+  Device,
+  ensureMediaPermissionsOnce,
+  enumerateDevices,
+  isNetworkSource,
+  isRtmpSource,
+  isRtspSource,
+  mergeVirtualAndHardwareCameras,
+  stopMediaStream,
+  toVirtualCameraDevice,
+  waitForSocketReady
+} from './core/webrtc/mediaCore'
 
-// @ts-ignore
-import JSMpeg from 'jsmpeg'
+const DISPLAY_COUNT = 4
+const EMPTY_SOURCES = Array(DISPLAY_COUNT).fill('')
+const EMPTY_LOADING = Array(DISPLAY_COUNT).fill(false)
 
-interface Device {
-  deviceId: string
-  label: string
-  kind: MediaDeviceKind
+type NetworkPoolItem = {
+  wsUrl: string
+  refCount: number
+}
+
+type HardwarePoolItem = {
+  stream: MediaStream
+  refCount: number
 }
 
 function App(): React.JSX.Element {
@@ -16,183 +36,204 @@ function App(): React.JSX.Element {
   const [speakers, setSpeakers] = useState<Device[]>([])
 
   const [selectedMic, setSelectedMic] = useState<string>('')
-  const [selectedCamera, setSelectedCamera] = useState<string>('')
   const [selectedSpeaker, setSelectedSpeaker] = useState<string>('')
+  const [displaySources, setDisplaySources] = useState<string[]>(EMPTY_SOURCES)
 
   const [rtspUrl, setRtspUrl] = useState<string>('')
+  const [rtmpUrl, setRtmpUrl] = useState<string>('')
 
   const [showPreview, setShowPreview] = useState(false)
   const [isLoadingDevices, setIsLoadingDevices] = useState(true)
-  const [isLoadingCamera, setIsLoadingCamera] = useState(false)
+  const [isSwitchingAudio, setIsSwitchingAudio] = useState(false)
+  const [tileLoading, setTileLoading] = useState<boolean[]>(EMPTY_LOADING)
 
-  const videoRef = useRef<HTMLVideoElement>(null)
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const meterRef = useRef<HTMLMeterElement>(null)
+  const videoRefs = useRef<(HTMLVideoElement | null)[]>(Array(DISPLAY_COUNT).fill(null))
+  const canvasRefs = useRef<(HTMLCanvasElement | null)[]>(Array(DISPLAY_COUNT).fill(null))
+  const tilePlayersRef = useRef<any[]>(Array(DISPLAY_COUNT).fill(null))
+  const tileNetworkSourceRef = useRef<(string | null)[]>(Array(DISPLAY_COUNT).fill(null))
+  const tileHardwareSourceRef = useRef<(string | null)[]>(Array(DISPLAY_COUNT).fill(null))
+  const tileRunIdRef = useRef<number[]>(Array(DISPLAY_COUNT).fill(0))
+
   const audioRef = useRef<HTMLAudioElement>(null)
-  
-  const streamRef = useRef<MediaStream | null>(null)
-  const playerRef = useRef<any>(null)
-  
+  const meterRef = useRef<HTMLMeterElement>(null)
+
+  const micStreamRef = useRef<MediaStream | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
   const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
   const audioProcessorRef = useRef<ScriptProcessorNode | null>(null)
+  const micRunIdRef = useRef(0)
 
-  const getDevices = async () => {
-    setIsLoadingDevices(true)
-    try {
-      try { await navigator.mediaDevices.getUserMedia({ audio: true }) } catch (e) { console.warn('Audio err', e) }
-      try { await navigator.mediaDevices.getUserMedia({ video: true }) } catch (e) { console.warn('Video err', e) }
+  const permissionRequestedRef = useRef(false)
+  const deviceChangeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const networkPoolRef = useRef<Map<string, NetworkPoolItem>>(new Map())
+  const hardwarePoolRef = useRef<Map<string, HardwarePoolItem>>(new Map())
 
-      const devices = await navigator.mediaDevices.enumerateDevices()
-      const newMics = devices.filter((d) => d.kind === 'audioinput' && d.deviceId !== '')
-      const newCameras = devices.filter((d) => d.kind === 'videoinput' && d.deviceId !== '')
-      const newSpeakers = devices.filter((d) => d.kind === 'audiooutput' && d.deviceId !== '')
-
-      setMics(newMics)
-      // Keep existing RTSP virtual devices
-      setCameras(prev => {
-        const rtsps = prev.filter(c => c.deviceId.startsWith('rtsp://'))
-        return [...rtsps, ...newCameras]
-      })
-      setSpeakers(newSpeakers)
-
-      if (newMics.length > 0 && !selectedMic) setSelectedMic(newMics[0].deviceId)
-      if (newCameras.length > 0 && !selectedCamera) setSelectedCamera(newCameras[0].deviceId)
-      if (newSpeakers.length > 0 && !selectedSpeaker) setSelectedSpeaker(newSpeakers[0].deviceId)
-    } catch (e) {
-      console.error('Error getting devices:', e)
-    } finally {
-      setIsLoadingDevices(false)
-    }
+  const setTileLoadingAt = (index: number, loading: boolean) => {
+    setTileLoading((previous) => previous.map((value, idx) => (idx === index ? loading : value)))
   }
 
-  useEffect(() => {
-    getDevices()
-    const handleDeviceChange = () => getDevices()
-    navigator.mediaDevices.addEventListener('devicechange', handleDeviceChange)
-    return () => {
-      navigator.mediaDevices.removeEventListener('devicechange', handleDeviceChange)
-    }
-  }, [])
-
-  useEffect(() => {
-    if (showPreview) {
-      setIsLoadingCamera(true)
-      Promise.all([startCamera(), startMicrophone()]).finally(() => {
-        setIsLoadingCamera(false)
-      })
-    }
-  }, [showPreview, selectedCamera, selectedMic])
-
-  useEffect(() => {
-    // If we have an audio ref and a selected speaker, attempt to set the sink ID.
-    // We add showPreview to dependencies because audioRef is null until showPreview is true.
-    if (audioRef.current && selectedSpeaker && showPreview) {
-      // @ts-ignore
-      if (typeof audioRef.current.setSinkId === 'function') {
-        // @ts-ignore
-        audioRef.current.setSinkId(selectedSpeaker).catch(console.error)
-      }
-    }
-  }, [selectedSpeaker, showPreview])
-
-  const stopTracks = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop())
-    }
+  const teardownAudioMeter = () => {
     if (audioSourceRef.current) {
       audioSourceRef.current.disconnect()
       audioSourceRef.current = null
     }
     if (audioProcessorRef.current) {
       audioProcessorRef.current.disconnect()
+      audioProcessorRef.current.onaudioprocess = null
       audioProcessorRef.current = null
     }
   }
 
-  const stopRtsp = () => {
-    if (playerRef.current) {
-      playerRef.current.destroy()
-      playerRef.current = null
+  const acquireNetworkSource = async (sourceId: string): Promise<string> => {
+    const existing = networkPoolRef.current.get(sourceId)
+    if (existing) {
+      existing.refCount += 1
+      return existing.wsUrl
     }
-    // @ts-ignore
-    window.electron.ipcRenderer.send('stop-rtsp')
+
+    const response = await window.electron.ipcRenderer.invoke('acquire-network-stream', sourceId)
+    const wsUrl = typeof response === 'string' ? response : response?.wsUrl
+    if (!wsUrl) {
+      throw new Error(`Could not acquire network stream for ${sourceId}`)
+    }
+
+    await waitForSocketReady(wsUrl, 3000, 120)
+    networkPoolRef.current.set(sourceId, { wsUrl, refCount: 1 })
+    return wsUrl
   }
 
-  const startCamera = async () => {
-    if (!selectedCamera) return
-    
-    // Stop any active WebRTC video streams
-    if (videoRef.current && videoRef.current.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream
-      stream.getTracks().forEach(t => t.stop())
-      videoRef.current.srcObject = null
-    }
-    
-    // Stop any active RTSP streams
-    stopRtsp()
+  const releaseNetworkSource = async (sourceId: string) => {
+    const existing = networkPoolRef.current.get(sourceId)
+    if (!existing) return
 
-    if (selectedCamera.startsWith('rtsp://')) {
-      // It's an RTSP stream!
-      // Send IPC request to start the transcoding
-      // @ts-ignore
-      window.electron.ipcRenderer.send('start-rtsp', selectedCamera)
-      
-      // Wait a tiny bit for the websocket to come up, then create the JSMpeg player
-      setTimeout(() => {
-        if (canvasRef.current) {
-          playerRef.current = new JSMpeg.Player('ws://localhost:9999', {
-            canvas: canvasRef.current,
-            videoBufferSize: 1024 * 1024 * 4 // 4MB Buffer
-          })
-        }
-      }, 1000)
-    } else {
-      // Regular WebRTC hardware
-      try {
-        const constraints = {
-          video: { deviceId: { exact: selectedCamera } }
-        }
-        const stream = await navigator.mediaDevices.getUserMedia(constraints)
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream
-        }
-      } catch (e) {
-        console.error(e)
-      }
+    existing.refCount -= 1
+    if (existing.refCount <= 0) {
+      networkPoolRef.current.delete(sourceId)
+      await window.electron.ipcRenderer.invoke('release-network-stream', sourceId)
     }
   }
 
-  const startMicrophone = async () => {
-    if (!selectedMic) return
-    try {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext
-      if (!audioContextRef.current) {
-        audioContextRef.current = new AudioCtx()
-      }
-      if (audioContextRef.current.state === 'suspended') {
-        await audioContextRef.current.resume()
-      }
-      
-      const constraints = {
-        audio: { deviceId: { exact: selectedMic } }
-      }
-      const stream = await navigator.mediaDevices.getUserMedia(constraints)
-      
-      if (streamRef.current) stopTracks()
-      streamRef.current = stream
-
-      setupSoundMeter(stream)
-    } catch (e) {
-      console.error(e)
+  const acquireHardwareSource = async (sourceId: string): Promise<MediaStream> => {
+    const existing = hardwarePoolRef.current.get(sourceId)
+    if (existing) {
+      existing.refCount += 1
+      return existing.stream
     }
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: { exact: sourceId } }
+    })
+    hardwarePoolRef.current.set(sourceId, { stream, refCount: 1 })
+    return stream
+  }
+
+  const releaseHardwareSource = (sourceId: string) => {
+    const existing = hardwarePoolRef.current.get(sourceId)
+    if (!existing) return
+
+    existing.refCount -= 1
+    if (existing.refCount <= 0) {
+      stopMediaStream(existing.stream)
+      hardwarePoolRef.current.delete(sourceId)
+    }
+  }
+
+  const stopTile = async (index: number) => {
+    destroyPlayer(tilePlayersRef.current[index])
+    tilePlayersRef.current[index] = null
+
+    const networkSource = tileNetworkSourceRef.current[index]
+    if (networkSource) {
+      tileNetworkSourceRef.current[index] = null
+      await releaseNetworkSource(networkSource)
+    }
+
+    const hardwareSource = tileHardwareSourceRef.current[index]
+    if (hardwareSource) {
+      tileHardwareSourceRef.current[index] = null
+      releaseHardwareSource(hardwareSource)
+    }
+
+    const video = videoRefs.current[index]
+    if (video) {
+      video.srcObject = null
+    }
+  }
+
+  const startTile = async (index: number, sourceId: string, runId: number) => {
+    await stopTile(index)
+    if (!sourceId) return
+
+    if (isNetworkSource(sourceId)) {
+      const wsUrl = await acquireNetworkSource(sourceId)
+      if (tileRunIdRef.current[index] !== runId) {
+        await releaseNetworkSource(sourceId)
+        return
+      }
+
+      const canvas = canvasRefs.current[index]
+      if (!canvas) {
+        await releaseNetworkSource(sourceId)
+        throw new Error(`Display ${index + 1} canvas was not ready`)
+      }
+
+      tilePlayersRef.current[index] = createJsmpegPlayer(canvas, wsUrl)
+      tileNetworkSourceRef.current[index] = sourceId
+      return
+    }
+
+    const stream = await acquireHardwareSource(sourceId)
+    if (tileRunIdRef.current[index] !== runId) {
+      releaseHardwareSource(sourceId)
+      return
+    }
+
+    const video = videoRefs.current[index]
+    if (!video) {
+      releaseHardwareSource(sourceId)
+      throw new Error(`Display ${index + 1} video element was not ready`)
+    }
+
+    tileHardwareSourceRef.current[index] = sourceId
+    video.srcObject = stream
+    await video.play().catch(() => undefined)
+  }
+
+  const switchTileSource = useCallback((index: number, sourceId: string) => {
+    const runId = tileRunIdRef.current[index] + 1
+    tileRunIdRef.current[index] = runId
+    setTileLoadingAt(index, true)
+
+    startTile(index, sourceId, runId)
+      .catch((error) => {
+        console.error(`Failed switching display ${index + 1}:`, error)
+      })
+      .finally(() => {
+        if (tileRunIdRef.current[index] === runId) {
+          setTileLoadingAt(index, false)
+        }
+      })
+  }, [])
+
+  const stopAllTiles = useCallback(async (resetLoading = true) => {
+    await Promise.all(Array.from({ length: DISPLAY_COUNT }, (_, index) => stopTile(index)))
+    if (resetLoading) {
+      setTileLoading(Array(DISPLAY_COUNT).fill(false))
+    }
+  }, [])
+
+  const stopMicrophone = () => {
+    teardownAudioMeter()
+    stopMediaStream(micStreamRef.current)
+    micStreamRef.current = null
+    if (meterRef.current) meterRef.current.value = 0
   }
 
   const setupSoundMeter = (stream: MediaStream) => {
-    const context = audioContextRef.current!
-    
-    if (audioSourceRef.current) audioSourceRef.current.disconnect()
-    if (audioProcessorRef.current) audioProcessorRef.current.disconnect()
+    const context = audioContextRef.current
+    if (!context) return
+
+    teardownAudioMeter()
 
     const source = context.createMediaStreamSource(stream)
     const processor = context.createScriptProcessor(2048, 1, 1)
@@ -201,41 +242,198 @@ function App(): React.JSX.Element {
     audioProcessorRef.current = processor
 
     processor.onaudioprocess = (event) => {
-      const input = event.inputBuffer.getChannelData(0)
-      let sum = 0.0
-      for (let i = 0; i < input.length; ++i) {
-        sum += input[i] * input[i]
-      }
-      const instant = Math.sqrt(sum / input.length)
-      if (meterRef.current) {
-        meterRef.current.value = instant
-      }
+      const instant = calculateRms(event.inputBuffer.getChannelData(0))
+      if (meterRef.current) meterRef.current.value = instant
     }
 
     source.connect(processor)
     processor.connect(context.destination)
   }
 
-  const handleAddRtsp = () => {
-    if (rtspUrl && rtspUrl.startsWith('rtsp://')) {
-      const newRtspDevice: Device = {
-        deviceId: rtspUrl,
-        label: `RTSP: ${rtspUrl.substring(0, 20)}...`,
-        kind: 'videoinput'
-      }
-      setCameras(prev => [...prev, newRtspDevice])
-      setSelectedCamera(rtspUrl)
-      setRtspUrl('')
-    } else {
-      alert("Please enter a valid RTSP URL starting with rtsp://")
+  const startMicrophone = async (micId: string) => {
+    if (!micId) return
+
+    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioCtx()
     }
+    if (audioContextRef.current.state === 'suspended') {
+      await audioContextRef.current.resume()
+    }
+
+    const nextMicStream = await navigator.mediaDevices.getUserMedia({
+      audio: { deviceId: { exact: micId } }
+    })
+
+    const previousMicStream = micStreamRef.current
+    micStreamRef.current = nextMicStream
+    stopMediaStream(previousMicStream)
+    setupSoundMeter(nextMicStream)
+  }
+
+  const refreshDevices = useCallback(async () => {
+    setIsLoadingDevices(true)
+    try {
+      await ensureMediaPermissionsOnce(permissionRequestedRef)
+      const { microphones, cameras: hardwareCameras, speakers: availableSpeakers } =
+        await enumerateDevices()
+
+      setMics(microphones)
+      setSelectedMic((previous) =>
+        microphones.some((mic) => mic.deviceId === previous) ? previous : (microphones[0]?.deviceId ?? '')
+      )
+
+      setCameras((previous) => {
+        const merged = mergeVirtualAndHardwareCameras(previous, hardwareCameras)
+        setDisplaySources((previousSources) =>
+          previousSources.map((sourceId) =>
+            merged.some((camera) => camera.deviceId === sourceId) ? sourceId : (merged[0]?.deviceId ?? '')
+          )
+        )
+        return merged
+      })
+
+      setSpeakers(availableSpeakers)
+      setSelectedSpeaker((previous) =>
+        availableSpeakers.some((speaker) => speaker.deviceId === previous)
+          ? previous
+          : (availableSpeakers[0]?.deviceId ?? '')
+      )
+    } catch (error) {
+      console.error('Error getting devices:', error)
+    } finally {
+      setIsLoadingDevices(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    refreshDevices()
+
+    const handleDeviceChange = () => {
+      if (deviceChangeDebounceRef.current) {
+        clearTimeout(deviceChangeDebounceRef.current)
+      }
+      deviceChangeDebounceRef.current = setTimeout(() => {
+        refreshDevices()
+      }, 250)
+    }
+
+    navigator.mediaDevices.addEventListener('devicechange', handleDeviceChange)
+
+    return () => {
+      navigator.mediaDevices.removeEventListener('devicechange', handleDeviceChange)
+      if (deviceChangeDebounceRef.current) clearTimeout(deviceChangeDebounceRef.current)
+
+      stopMicrophone()
+
+      for (let index = 0; index < DISPLAY_COUNT; index += 1) {
+        destroyPlayer(tilePlayersRef.current[index])
+        tilePlayersRef.current[index] = null
+        tileNetworkSourceRef.current[index] = null
+        tileHardwareSourceRef.current[index] = null
+        const video = videoRefs.current[index]
+        if (video) video.srcObject = null
+      }
+
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(console.error)
+        audioContextRef.current = null
+      }
+
+      for (const [sourceId, item] of networkPoolRef.current.entries()) {
+        for (let i = 0; i < item.refCount; i += 1) {
+          void window.electron.ipcRenderer.invoke('release-network-stream', sourceId)
+        }
+      }
+      networkPoolRef.current.clear()
+
+      for (const item of hardwarePoolRef.current.values()) {
+        stopMediaStream(item.stream)
+      }
+      hardwarePoolRef.current.clear()
+    }
+  }, [refreshDevices, stopAllTiles])
+
+  useEffect(() => {
+    if (!(audioRef.current && selectedSpeaker && showPreview)) return
+    // @ts-ignore
+    if (typeof audioRef.current.setSinkId === 'function') {
+      // @ts-ignore
+      audioRef.current.setSinkId(selectedSpeaker).catch(console.error)
+    }
+  }, [selectedSpeaker, showPreview])
+
+  useEffect(() => {
+    if (!showPreview || !selectedMic) return
+
+    const runId = ++micRunIdRef.current
+    setIsSwitchingAudio(true)
+
+    startMicrophone(selectedMic)
+      .catch(console.error)
+      .finally(() => {
+        if (runId === micRunIdRef.current) setIsSwitchingAudio(false)
+      })
+  }, [selectedMic, showPreview])
+
+  useEffect(() => {
+    if (!showPreview) {
+      void stopAllTiles()
+      return
+    }
+
+    displaySources.forEach((sourceId, index) => {
+      switchTileSource(index, sourceId)
+    })
+  }, [showPreview, stopAllTiles, switchTileSource])
+
+  const handleDisplaySourceChange = (index: number, nextSourceId: string) => {
+    setDisplaySources((previous) =>
+      previous.map((value, idx) => (idx === index ? nextSourceId : value))
+    )
+
+    if (showPreview) {
+      switchTileSource(index, nextSourceId)
+    }
+  }
+
+  const handleAddRtsp = () => {
+    if (!(rtspUrl && isRtspSource(rtspUrl))) {
+      alert('Please enter a valid RTSP URL starting with rtsp://')
+      return
+    }
+
+    const newRtspDevice = toVirtualCameraDevice(rtspUrl)
+    setCameras((previous) => {
+      const next = [...previous, newRtspDevice]
+      return next.filter(
+        (camera, index, all) => all.findIndex((item) => item.deviceId === camera.deviceId) === index
+      )
+    })
+    setRtspUrl('')
+  }
+
+  const handleAddRtmp = () => {
+    if (!(rtmpUrl && isRtmpSource(rtmpUrl))) {
+      alert('Please enter a valid RTMP URL starting with rtmp://')
+      return
+    }
+
+    const newRtmpDevice = toVirtualCameraDevice(rtmpUrl)
+    setCameras((previous) => {
+      const next = [...previous, newRtmpDevice]
+      return next.filter(
+        (camera, index, all) => all.findIndex((item) => item.deviceId === camera.deviceId) === index
+      )
+    })
+    setRtmpUrl('')
   }
 
   return (
     <>
       <h1 className="text">CAMERA NORA DANISH</h1>
 
-      <div className="av-container">
+      <div className="av-container multi">
         {isLoadingDevices ? (
           <div className="loader-container">
             <div className="spinner"></div>
@@ -249,60 +447,140 @@ function App(): React.JSX.Element {
           </div>
         ) : (
           <>
-            {isLoadingCamera ? (
-              <div className="loader-container">
-                <div className="spinner"></div>
-                <div>Starting Camera & Audio...</div>
-              </div>
-            ) : (
-              <div className="av-preview">
-                {selectedCamera.startsWith('rtsp://') ? (
-                   <canvas ref={canvasRef} style={{ maxWidth: '100%', borderRadius: 8, background: '#000' }}></canvas>
-                ) : (
-                   <video ref={videoRef} autoPlay muted playsInline></video>
-                )}
-                <meter ref={meterRef} high={0.35} max={1} value={0}></meter>
-              </div>
-            )}
-            
+            <div className="multi-preview-grid">
+              {displaySources.map((sourceId, index) => (
+                <div className="display-card" key={`display-${index}`}>
+                  <div className="display-head">
+                    <span>{`Display ${index + 1}`}</span>
+                    <select
+                      value={sourceId}
+                      onChange={(event) => handleDisplaySourceChange(index, event.target.value)}
+                    >
+                      {cameras.length === 0 && <option value="">Choose camera</option>}
+                      {cameras.map((camera) => (
+                        <option key={`${index}-${camera.deviceId}`} value={camera.deviceId}>
+                          {camera.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="display-frame">
+                    {isNetworkSource(sourceId) ? (
+                      <canvas
+                        ref={(element) => {
+                          canvasRefs.current[index] = element
+                        }}
+                      ></canvas>
+                    ) : (
+                      <video
+                        ref={(element) => {
+                          videoRefs.current[index] = element
+                        }}
+                        autoPlay
+                        muted
+                        playsInline
+                      ></video>
+                    )}
+
+                    {tileLoading[index] && (
+                      <div className="tile-loader">
+                        <div className="spinner"></div>
+                        <div>Switching source...</div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+
             <div className="av-devices">
-              <div className="device-select">
-                <label>Microphone:</label>
-                <select value={selectedMic} onChange={(e) => setSelectedMic(e.target.value)}>
-                  {mics.length === 0 && <option>Choose microphone</option>}
-                  {mics.map(m => <option key={m.deviceId} value={m.deviceId}>{m.label}</option>)}
-                </select>
-              </div>
-
-              <div className="device-select">
-                <label>Camera:</label>
-                <select value={selectedCamera} onChange={(e) => setSelectedCamera(e.target.value)}>
-                  {cameras.length === 0 && <option>Choose camera</option>}
-                  {cameras.map(c => <option key={c.deviceId} value={c.deviceId}>{c.label}</option>)}
-                </select>
-              </div>
-
-              {/* RTSP Add input */}
               <div style={{ display: 'flex', gap: 10, marginTop: '-5px', marginBottom: '10px' }}>
-                <input 
-                  type="text" 
-                  placeholder="rtsp://your-camera-url" 
+                <input
+                  type="text"
+                  placeholder="rtsp://your-camera-url"
                   value={rtspUrl}
                   onChange={(e) => setRtspUrl(e.target.value)}
-                  style={{ flex: 1, padding: 8, borderRadius: 4, background: '#333', color: '#fff', border: 'none' }}
+                  style={{
+                    flex: 1,
+                    padding: 8,
+                    borderRadius: 4,
+                    background: '#333',
+                    color: '#fff',
+                    border: 'none'
+                  }}
                 />
-                <button 
+                <button
                   onClick={handleAddRtsp}
-                  style={{ padding: 8, borderRadius: 4, background: 'var(--ev-c-brand)', color: '#fff', border: 'none', cursor: 'pointer', fontWeight: 'bold' }}>
+                  style={{
+                    padding: 8,
+                    borderRadius: 4,
+                    background: 'var(--ev-c-brand)',
+                    color: '#fff',
+                    border: 'none',
+                    cursor: 'pointer',
+                    fontWeight: 'bold'
+                  }}
+                >
                   Add RTSP
                 </button>
               </div>
 
+              <div style={{ display: 'flex', gap: 10, marginTop: '-5px', marginBottom: '10px' }}>
+                <input
+                  type="text"
+                  placeholder="rtmp://your-stream-url"
+                  value={rtmpUrl}
+                  onChange={(e) => setRtmpUrl(e.target.value)}
+                  style={{
+                    flex: 1,
+                    padding: 8,
+                    borderRadius: 4,
+                    background: '#333',
+                    color: '#fff',
+                    border: 'none'
+                  }}
+                />
+                <button
+                  onClick={handleAddRtmp}
+                  style={{
+                    padding: 8,
+                    borderRadius: 4,
+                    background: '#e44d26',
+                    color: '#fff',
+                    border: 'none',
+                    cursor: 'pointer',
+                    fontWeight: 'bold'
+                  }}
+                >
+                  Add RTMP
+                </button>
+              </div>
+
+              <div className="device-select">
+                <label>Microphone:</label>
+                <select value={selectedMic} onChange={(e) => setSelectedMic(e.target.value)}>
+                  {mics.length === 0 && <option value="">Choose microphone</option>}
+                  {mics.map((mic) => (
+                    <option key={mic.deviceId} value={mic.deviceId}>
+                      {mic.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <meter ref={meterRef} high={0.35} max={1} value={0}></meter>
+              {isSwitchingAudio && <div style={{ fontSize: 12, opacity: 0.8 }}>Switching microphone...</div>}
+
               <div className="device-select">
                 <label>Speaker:</label>
                 <select value={selectedSpeaker} onChange={(e) => setSelectedSpeaker(e.target.value)}>
-                  {speakers.length === 0 && <option>Choose speaker</option>}
-                  {speakers.map(s => <option key={s.deviceId} value={s.deviceId}>{s.label}</option>)}
+                  {speakers.length === 0 && <option value="">Choose speaker</option>}
+                  {speakers.map((speaker) => (
+                    <option key={speaker.deviceId} value={speaker.deviceId}>
+                      {speaker.label}
+                    </option>
+                  ))}
                 </select>
               </div>
 

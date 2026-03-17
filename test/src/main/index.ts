@@ -8,10 +8,72 @@ const Stream = require('node-rtsp-stream')
 // @ts-ignore
 const ffmpegPath = require('ffmpeg-static')
 
-let rtspStream: any = null
+type ManagedStream = {
+  stream: any
+  wsPort: number
+  wsUrl: string
+  refCount: number
+}
+
+const BASE_WS_PORT = 11000
+const MAX_WS_PORT = 12999
+const LOCAL_WS_HOST = '127.0.0.1'
+
+const managedNetworkStreams = new Map<string, ManagedStream>()
+const usedWsPorts = new Set<number>()
+
+const allocateWsPort = (): number => {
+  for (let port = BASE_WS_PORT; port <= MAX_WS_PORT; port += 1) {
+    if (!usedWsPorts.has(port)) {
+      usedWsPorts.add(port)
+      return port
+    }
+  }
+  throw new Error('No available websocket ports for network streams')
+}
+
+const releaseWsPort = (port: number): void => {
+  usedWsPorts.delete(port)
+}
+
+const createManagedNetworkStream = (sourceUrl: string): ManagedStream => {
+  const wsPort = allocateWsPort()
+  const stream = new Stream({
+    name: `network-stream-${wsPort}`,
+    streamUrl: sourceUrl,
+    wsPort,
+    ffmpegPath,
+    ffmpegOptions: {
+      '-stats': '',
+      '-r': 30,
+      '-fflags': 'nobuffer',
+      '-flags': 'low_delay'
+    }
+  })
+
+  return {
+    stream,
+    wsPort,
+    wsUrl: `ws://${LOCAL_WS_HOST}:${wsPort}`,
+    refCount: 1
+  }
+}
+
+const stopManagedNetworkStream = (sourceUrl: string): void => {
+  const managed = managedNetworkStreams.get(sourceUrl)
+  if (!managed) return
+
+  try {
+    managed.stream.stop()
+  } catch (error) {
+    console.error(`Failed stopping stream for ${sourceUrl}:`, error)
+  } finally {
+    releaseWsPort(managed.wsPort)
+    managedNetworkStreams.delete(sourceUrl)
+  }
+}
 
 function createWindow(): void {
-  // Create the browser window.
   const mainWindow = new BrowserWindow({
     width: 2880,
     height: 1920,
@@ -33,8 +95,6 @@ function createWindow(): void {
     return { action: 'deny' }
   })
 
-  // HMR for renderer base on electron-vite cli.
-  // Load the remote URL for development or the local html file for production.
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
     mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
@@ -42,63 +102,59 @@ function createWindow(): void {
   }
 }
 
-// This method will be called when Electron has finished
-// initialization and is ready to create browser windows.
-// Some APIs can only be used after this event occurs.
 app.whenReady().then(() => {
-  // Set app user model id for windows
   electronApp.setAppUserModelId('com.electron')
 
-  // Default open or close DevTools by F12 in development
-  // and ignore CommandOrControl + R in production.
-  // see https://github.com/alex8088/electron-toolkit/tree/master/packages/utils
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
   })
 
-  // IPC test
   ipcMain.on('ping', () => console.log('pong'))
 
-  ipcMain.on('start-rtsp', (_, url) => {
-    if (rtspStream) {
-      rtspStream.stop()
+  ipcMain.handle('acquire-network-stream', (_, sourceUrl: string) => {
+    if (!sourceUrl) {
+      throw new Error('Source URL is required')
     }
-    rtspStream = new Stream({
-      name: 'rtsp-camera',
-      streamUrl: url,
-      wsPort: 9999,
-      ffmpegPath: ffmpegPath,
-      ffmpegOptions: {
-        '-stats': '', 
-        '-r': 30
-      }
-    })
+
+    const existing = managedNetworkStreams.get(sourceUrl)
+    if (existing) {
+      existing.refCount += 1
+      return { wsUrl: existing.wsUrl }
+    }
+
+    const created = createManagedNetworkStream(sourceUrl)
+    managedNetworkStreams.set(sourceUrl, created)
+    return { wsUrl: created.wsUrl }
   })
 
-  ipcMain.on('stop-rtsp', () => {
-    if (rtspStream) {
-      rtspStream.stop()
-      rtspStream = null
+  ipcMain.handle('release-network-stream', (_, sourceUrl: string) => {
+    const existing = managedNetworkStreams.get(sourceUrl)
+    if (!existing) {
+      return { released: false }
     }
+
+    existing.refCount -= 1
+    if (existing.refCount <= 0) {
+      stopManagedNetworkStream(sourceUrl)
+      return { released: true }
+    }
+
+    return { released: false }
   })
 
   createWindow()
 
   app.on('activate', function () {
-    // On macOS it's common to re-create a window in the app when the
-    // dock icon is clicked and there are no other windows open.
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
 })
 
-// Quit when all windows are closed, except on macOS. There, it's common
-// for applications and their menu bar to stay active until the user quits
-// explicitly with Cmd + Q.
 app.on('window-all-closed', () => {
+  for (const sourceUrl of [...managedNetworkStreams.keys()]) {
+    stopManagedNetworkStream(sourceUrl)
+  }
+
   if (process.platform !== 'darwin') {
     app.quit()
   }
 })
-
-// In this file you can include the rest of your app's specific main process
-// code. You can also put them in separate files and require them here.

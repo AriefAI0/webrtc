@@ -31,28 +31,8 @@ code {
   align-items: center;
   justify-content: center;
   flex-direction: column;
-  margin-bottom: 80px;
-}
-
-.logo {
-  margin-bottom: 20px;
-  -webkit-user-drag: none;
-  height: 128px;
-  width: 128px;
-  will-change: filter;
-  transition: filter 300ms;
-}
-
-.logo:hover {
-  filter: drop-shadow(0 0 1.2em #6988e6aa);
-}
-
-.creator {
-  font-size: 14px;
-  line-height: 16px;
-  color: var(--ev-c-text-2);
-  font-weight: 600;
-  margin-bottom: 10px;
+  width: 100%;
+  padding: 10px;
 }
 
 .text {
@@ -65,32 +45,9 @@ code {
   padding: 16px 0;
 }
 
-.tip {
-  font-size: 16px;
-  line-height: 24px;
-  color: var(--ev-c-text-2);
-  font-weight: 600;
-}
-
-.react {
-  background: -webkit-linear-gradient(315deg, #087ea4 55%, #7c93ee);
-  background-clip: text;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  font-weight: 700;
-}
-
-.ts {
-  background: -webkit-linear-gradient(315deg, #3178c6 45%, #f0dc4e);
-  background-clip: text;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  font-weight: 700;
-}
-
 .actions {
   display: flex;
-  padding-top: 32px;
+  padding-top: 10px;
   margin: -6px;
   flex-wrap: wrap;
   justify-content: flex-start;
@@ -124,91 +81,91 @@ code {
   background-color: var(--ev-button-alt-hover-bg);
 }
 
-.versions {
-  position: absolute;
-  bottom: 30px;
-  margin: 0 auto;
-  padding: 15px 0;
-  font-family: 'Menlo', 'Lucida Console', monospace;
-  display: inline-flex;
-  overflow: hidden;
-  align-items: center;
-  border-radius: 22px;
-  background-color: #202127;
-  backdrop-filter: blur(24px);
-}
-
-.versions li {
-  display: block;
-  float: left;
-  border-right: 1px solid var(--ev-c-gray-1);
-  padding: 0 20px;
-  font-size: 14px;
-  line-height: 14px;
-  opacity: 0.8;
-  &:last-child {
-    border: none;
-  }
-}
-
-@media (max-width: 720px) {
-  .text {
-    font-size: 20px;
-  }
-}
-
-@media (max-width: 620px) {
-  .versions {
-    display: none;
-  }
-}
-
-@media (max-width: 350px) {
-  .tip,
-  .actions {
-    display: none;
-  }
-}
-
-/* WebRTC Preview Styles */
 .av-container {
   padding: 20px;
-  background: rgba(0,0,0,0.5);
+  background: rgba(0, 0, 0, 0.55);
   border-radius: 10px;
-  margin-top: 20px;
-  width: 100%;
-  max-width: 600px;
+  margin-top: 12px;
+  width: min(1280px, 96vw);
   display: flex;
   flex-direction: column;
+  gap: 14px;
 }
 
-.av-container h2 {
-  text-align: center;
+.av-container.multi {
+  max-height: 84vh;
+  overflow: auto;
+}
+
+.multi-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.display-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.display-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   color: var(--ev-c-text-1);
 }
 
-.av-preview {
-  padding: 20px 0;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
+.display-head span {
+  font-weight: 600;
+  min-width: 72px;
 }
 
-.av-preview video {
-  max-width: 100%;
+.display-head select {
+  flex: 1;
+  min-width: 0;
+  padding: 6px;
+  border-radius: 4px;
+}
+
+.display-frame {
+  position: relative;
   border-radius: 8px;
+  overflow: hidden;
+  background: #000;
+  min-height: 170px;
+}
+
+.display-frame video,
+.display-frame canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 170px;
+  object-fit: contain;
   background: #000;
 }
 
-.av-preview meter {
-  width: 100%;
-  margin-top: 10px;
+.tile-loader {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  background: rgba(0, 0, 0, 0.45);
+  color: var(--ev-c-text-1);
 }
 
 .av-devices {
   display: flex;
   flex-direction: column;
-  gap: 15px;
+  gap: 12px;
 }
 
 .device-select {
@@ -226,11 +183,14 @@ code {
 }
 
 .av-devices audio {
-  margin-top: 20px;
+  margin-top: 4px;
   width: 100%;
 }
 
-/* Loader Styles */
+.av-devices meter {
+  width: 100%;
+}
+
 .loader-container {
   display: flex;
   flex-direction: column;
@@ -251,6 +211,27 @@ code {
 }
 
 @keyframes spin {
-  0% { transform: rotate(0deg); }
-  100% { transform: rotate(360deg); }
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 900px) {
+  .multi-preview-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .av-container {
+    width: min(700px, 96vw);
+  }
+}
+
+@media (max-width: 620px) {
+  .text {
+    font-size: 20px;
+    line-height: 24px;
+  }
 }
