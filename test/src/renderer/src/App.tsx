@@ -42,7 +42,7 @@ function App(): React.JSX.Element {
   const [rtspUrl, setRtspUrl] = useState<string>('')
   const [rtmpUrl, setRtmpUrl] = useState<string>('')
 
-  const [isLoadingDevices, setIsLoadingDevices] = useState(true)
+  const [isInitialLoading, setIsInitialLoading] = useState(true)
   const [isSwitchingAudio, setIsSwitchingAudio] = useState(false)
   const [tileLoading, setTileLoading] = useState<boolean[]>(EMPTY_LOADING)
 
@@ -68,7 +68,10 @@ function App(): React.JSX.Element {
   const hardwarePoolRef = useRef<Map<string, HardwarePoolItem>>(new Map())
   const networkAcquirePendingRef = useRef<Map<string, Promise<string>>>(new Map())
   const hardwareAcquirePendingRef = useRef<Map<string, Promise<MediaStream>>>(new Map())
-  const startedInitialPreviewRef = useRef(false)
+  const initialDeviceLoadDoneRef = useRef(false)
+  const previousDisplaySourcesRef = useRef<string[]>([...EMPTY_SOURCES])
+  const displaySourceBeforeInteractionRef = useRef<string[]>([...EMPTY_SOURCES])
+  const displaySourceInteractedRef = useRef<boolean[]>(Array(DISPLAY_COUNT).fill(false))
 
   const setTileLoadingAt = (index: number, loading: boolean) => {
     setTileLoading((previous) => previous.map((value, idx) => (idx === index ? loading : value)))
@@ -304,7 +307,11 @@ function App(): React.JSX.Element {
   }
 
   const refreshDevices = useCallback(async () => {
-    setIsLoadingDevices(true)
+    const shouldShowInitialLoader = !initialDeviceLoadDoneRef.current
+    if (shouldShowInitialLoader) {
+      setIsInitialLoading(true)
+    }
+
     try {
       await ensureMediaPermissionsOnce(permissionRequestedRef)
       const { microphones, cameras: hardwareCameras, speakers: availableSpeakers } =
@@ -334,7 +341,10 @@ function App(): React.JSX.Element {
     } catch (error) {
       console.error('Error getting devices:', error)
     } finally {
-      setIsLoadingDevices(false)
+      if (shouldShowInitialLoader) {
+        initialDeviceLoadDoneRef.current = true
+        setIsInitialLoading(false)
+      }
     }
   }, [])
 
@@ -451,18 +461,36 @@ function App(): React.JSX.Element {
   }, [selectedMic])
 
   useEffect(() => {
-    if (isLoadingDevices || startedInitialPreviewRef.current) return
-    startedInitialPreviewRef.current = true
+    if (isInitialLoading) return
+
     displaySources.forEach((sourceId, index) => {
-      switchTileSource(index, sourceId)
+      if (previousDisplaySourcesRef.current[index] !== sourceId) {
+        switchTileSource(index, sourceId)
+      }
     })
-  }, [displaySources, isLoadingDevices, switchTileSource])
+
+    previousDisplaySourcesRef.current = [...displaySources]
+  }, [displaySources, isInitialLoading, switchTileSource])
 
   const handleDisplaySourceChange = (index: number, nextSourceId: string) => {
-    setDisplaySources((previous) =>
-      previous.map((value, idx) => (idx === index ? nextSourceId : value))
-    )
-    switchTileSource(index, nextSourceId)
+    setDisplaySources((previous) => previous.map((value, idx) => (idx === index ? nextSourceId : value)))
+  }
+
+  const handleDisplaySourceInteractionStart = (index: number) => {
+    displaySourceBeforeInteractionRef.current[index] = displaySources[index]
+    displaySourceInteractedRef.current[index] = true
+  }
+
+  const handleDisplaySourceInteractionEnd = (index: number) => {
+    if (!displaySourceInteractedRef.current[index]) return
+    displaySourceInteractedRef.current[index] = false
+
+    const sourceBefore = displaySourceBeforeInteractionRef.current[index]
+    const currentSource = displaySources[index]
+
+    if (sourceBefore && currentSource && sourceBefore === currentSource) {
+      switchTileSource(index, currentSource)
+    }
   }
 
   const handleAddRtsp = () => {
@@ -497,7 +525,7 @@ function App(): React.JSX.Element {
     setRtmpUrl('')
   }
 
-  if (isLoadingDevices) {
+  if (isInitialLoading) {
     return (
       <div className="loader-container app-loader">
         <div className="spinner"></div>
@@ -508,7 +536,7 @@ function App(): React.JSX.Element {
 
   return (
     <div className="app-shell">
-      <h1 className="text">CAMERA NORA DANISH</h1>
+      <h1 className="text">CAMERA PREVIEW R&D :D</h1>
 
       <div className="av-container multi">
         <div className="workspace">
@@ -557,6 +585,9 @@ function App(): React.JSX.Element {
                 <select
                   value={sourceId}
                   onChange={(event) => handleDisplaySourceChange(index, event.target.value)}
+                  onMouseDown={() => handleDisplaySourceInteractionStart(index)}
+                  onFocus={() => handleDisplaySourceInteractionStart(index)}
+                  onBlur={() => handleDisplaySourceInteractionEnd(index)}
                 >
                   {cameras.length === 0 && <option value="">Choose camera</option>}
                   {cameras.map((camera) => (
