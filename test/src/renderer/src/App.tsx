@@ -42,7 +42,6 @@ function App(): React.JSX.Element {
   const [rtspUrl, setRtspUrl] = useState<string>('')
   const [rtmpUrl, setRtmpUrl] = useState<string>('')
 
-  const [showPreview, setShowPreview] = useState(false)
   const [isLoadingDevices, setIsLoadingDevices] = useState(true)
   const [isSwitchingAudio, setIsSwitchingAudio] = useState(false)
   const [tileLoading, setTileLoading] = useState<boolean[]>(EMPTY_LOADING)
@@ -67,6 +66,9 @@ function App(): React.JSX.Element {
   const deviceChangeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const networkPoolRef = useRef<Map<string, NetworkPoolItem>>(new Map())
   const hardwarePoolRef = useRef<Map<string, HardwarePoolItem>>(new Map())
+  const networkAcquirePendingRef = useRef<Map<string, Promise<string>>>(new Map())
+  const hardwareAcquirePendingRef = useRef<Map<string, Promise<MediaStream>>>(new Map())
+  const startedInitialPreviewRef = useRef(false)
 
   const setTileLoadingAt = (index: number, loading: boolean) => {
     setTileLoading((previous) => previous.map((value, idx) => (idx === index ? loading : value)))
@@ -91,15 +93,35 @@ function App(): React.JSX.Element {
       return existing.wsUrl
     }
 
-    const response = await window.electron.ipcRenderer.invoke('acquire-network-stream', sourceId)
-    const wsUrl = typeof response === 'string' ? response : response?.wsUrl
-    if (!wsUrl) {
-      throw new Error(`Could not acquire network stream for ${sourceId}`)
+    const pending = networkAcquirePendingRef.current.get(sourceId)
+    if (pending) {
+      const wsUrl = await pending
+      const current = networkPoolRef.current.get(sourceId)
+      if (!current) {
+        throw new Error(`Network source ${sourceId} was not registered after acquire`)
+      }
+      current.refCount += 1
+      return wsUrl
     }
 
-    await waitForSocketReady(wsUrl, 3000, 120)
-    networkPoolRef.current.set(sourceId, { wsUrl, refCount: 1 })
-    return wsUrl
+    const acquirePromise = (async () => {
+      const response = await window.electron.ipcRenderer.invoke('acquire-network-stream', sourceId)
+      const wsUrl = typeof response === 'string' ? response : response?.wsUrl
+      if (!wsUrl) {
+        throw new Error(`Could not acquire network stream for ${sourceId}`)
+      }
+
+      await waitForSocketReady(wsUrl, 3000, 120)
+      networkPoolRef.current.set(sourceId, { wsUrl, refCount: 1 })
+      return wsUrl
+    })()
+
+    networkAcquirePendingRef.current.set(sourceId, acquirePromise)
+    try {
+      return await acquirePromise
+    } finally {
+      networkAcquirePendingRef.current.delete(sourceId)
+    }
   }
 
   const releaseNetworkSource = async (sourceId: string) => {
@@ -120,11 +142,31 @@ function App(): React.JSX.Element {
       return existing.stream
     }
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { deviceId: { exact: sourceId } }
-    })
-    hardwarePoolRef.current.set(sourceId, { stream, refCount: 1 })
-    return stream
+    const pending = hardwareAcquirePendingRef.current.get(sourceId)
+    if (pending) {
+      const stream = await pending
+      const current = hardwarePoolRef.current.get(sourceId)
+      if (!current) {
+        throw new Error(`Hardware source ${sourceId} was not registered after acquire`)
+      }
+      current.refCount += 1
+      return stream
+    }
+
+    const acquirePromise = (async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { deviceId: { exact: sourceId } }
+      })
+      hardwarePoolRef.current.set(sourceId, { stream, refCount: 1 })
+      return stream
+    })()
+
+    hardwareAcquirePendingRef.current.set(sourceId, acquirePromise)
+    try {
+      return await acquirePromise
+    } finally {
+      hardwareAcquirePendingRef.current.delete(sourceId)
+    }
   }
 
   const releaseHardwareSource = (sourceId: string) => {
@@ -155,9 +197,7 @@ function App(): React.JSX.Element {
     }
 
     const video = videoRefs.current[index]
-    if (video) {
-      video.srcObject = null
-    }
+    if (video) video.srcObject = null
   }
 
   const startTile = async (index: number, sourceId: string, runId: number) => {
@@ -215,13 +255,6 @@ function App(): React.JSX.Element {
       })
   }, [])
 
-  const stopAllTiles = useCallback(async (resetLoading = true) => {
-    await Promise.all(Array.from({ length: DISPLAY_COUNT }, (_, index) => stopTile(index)))
-    if (resetLoading) {
-      setTileLoading(Array(DISPLAY_COUNT).fill(false))
-    }
-  }, [])
-
   const stopMicrophone = () => {
     teardownAudioMeter()
     stopMediaStream(micStreamRef.current)
@@ -234,7 +267,6 @@ function App(): React.JSX.Element {
     if (!context) return
 
     teardownAudioMeter()
-
     const source = context.createMediaStreamSource(stream)
     const processor = context.createScriptProcessor(2048, 1, 1)
 
@@ -309,6 +341,8 @@ function App(): React.JSX.Element {
   useEffect(() => {
     refreshDevices()
 
+    const mediaDevices = navigator.mediaDevices
+
     const handleDeviceChange = () => {
       if (deviceChangeDebounceRef.current) {
         clearTimeout(deviceChangeDebounceRef.current)
@@ -318,10 +352,48 @@ function App(): React.JSX.Element {
       }, 250)
     }
 
-    navigator.mediaDevices.addEventListener('devicechange', handleDeviceChange)
+    const toDeviceSignature = (devices: MediaDeviceInfo[]): string =>
+      devices
+        .filter((device) => device.deviceId !== '')
+        .map((device) => `${device.kind}:${device.deviceId}`)
+        .sort()
+        .join('|')
+
+    let devicePollInterval: ReturnType<typeof setInterval> | null = null
+    let isPolling = false
+    let lastDeviceSignature = ''
+
+    const pollForDeviceChanges = async () => {
+      if (isPolling || !mediaDevices?.enumerateDevices) return
+      isPolling = true
+      try {
+        const devices = await mediaDevices.enumerateDevices()
+        const signature = toDeviceSignature(devices)
+        if (!lastDeviceSignature) {
+          lastDeviceSignature = signature
+          return
+        }
+        if (signature !== lastDeviceSignature) {
+          lastDeviceSignature = signature
+          handleDeviceChange()
+        }
+      } catch {
+        // Ignore transient enumerateDevices errors while polling.
+      } finally {
+        isPolling = false
+      }
+    }
+
+    mediaDevices.addEventListener('devicechange', handleDeviceChange)
+
+    void pollForDeviceChanges()
+    devicePollInterval = setInterval(() => {
+      void pollForDeviceChanges()
+    }, 2000)
 
     return () => {
-      navigator.mediaDevices.removeEventListener('devicechange', handleDeviceChange)
+      mediaDevices.removeEventListener('devicechange', handleDeviceChange)
+      if (devicePollInterval) clearInterval(devicePollInterval)
       if (deviceChangeDebounceRef.current) clearTimeout(deviceChangeDebounceRef.current)
 
       stopMicrophone()
@@ -346,25 +418,27 @@ function App(): React.JSX.Element {
         }
       }
       networkPoolRef.current.clear()
+      networkAcquirePendingRef.current.clear()
 
       for (const item of hardwarePoolRef.current.values()) {
         stopMediaStream(item.stream)
       }
       hardwarePoolRef.current.clear()
+      hardwareAcquirePendingRef.current.clear()
     }
-  }, [refreshDevices, stopAllTiles])
+  }, [refreshDevices])
 
   useEffect(() => {
-    if (!(audioRef.current && selectedSpeaker && showPreview)) return
+    if (!(audioRef.current && selectedSpeaker)) return
     // @ts-ignore
     if (typeof audioRef.current.setSinkId === 'function') {
       // @ts-ignore
       audioRef.current.setSinkId(selectedSpeaker).catch(console.error)
     }
-  }, [selectedSpeaker, showPreview])
+  }, [selectedSpeaker])
 
   useEffect(() => {
-    if (!showPreview || !selectedMic) return
+    if (!selectedMic) return
 
     const runId = ++micRunIdRef.current
     setIsSwitchingAudio(true)
@@ -374,27 +448,21 @@ function App(): React.JSX.Element {
       .finally(() => {
         if (runId === micRunIdRef.current) setIsSwitchingAudio(false)
       })
-  }, [selectedMic, showPreview])
+  }, [selectedMic])
 
   useEffect(() => {
-    if (!showPreview) {
-      void stopAllTiles()
-      return
-    }
-
+    if (isLoadingDevices || startedInitialPreviewRef.current) return
+    startedInitialPreviewRef.current = true
     displaySources.forEach((sourceId, index) => {
       switchTileSource(index, sourceId)
     })
-  }, [showPreview, stopAllTiles, switchTileSource])
+  }, [displaySources, isLoadingDevices, switchTileSource])
 
   const handleDisplaySourceChange = (index: number, nextSourceId: string) => {
     setDisplaySources((previous) =>
       previous.map((value, idx) => (idx === index ? nextSourceId : value))
     )
-
-    if (showPreview) {
-      switchTileSource(index, nextSourceId)
-    }
+    switchTileSource(index, nextSourceId)
   }
 
   const handleAddRtsp = () => {
@@ -429,172 +497,143 @@ function App(): React.JSX.Element {
     setRtmpUrl('')
   }
 
+  if (isLoadingDevices) {
+    return (
+      <div className="loader-container app-loader">
+        <div className="spinner"></div>
+        <div>Loading devices...</div>
+      </div>
+    )
+  }
+
   return (
-    <>
+    <div className="app-shell">
       <h1 className="text">CAMERA NORA DANISH</h1>
 
       <div className="av-container multi">
-        {isLoadingDevices ? (
-          <div className="loader-container">
-            <div className="spinner"></div>
-            <div>Loading Devices...</div>
-          </div>
-        ) : !showPreview ? (
-          <div className="actions" style={{ justifyContent: 'center' }}>
-            <div className="action">
-              <a onClick={() => setShowPreview(true)}>Show A/V preview</a>
-            </div>
-          </div>
-        ) : (
-          <>
-            <div className="multi-preview-grid">
-              {displaySources.map((sourceId, index) => (
-                <div className="display-card" key={`display-${index}`}>
-                  <div className="display-head">
-                    <span>{`Display ${index + 1}`}</span>
-                    <select
-                      value={sourceId}
-                      onChange={(event) => handleDisplaySourceChange(index, event.target.value)}
-                    >
-                      {cameras.length === 0 && <option value="">Choose camera</option>}
-                      {cameras.map((camera) => (
-                        <option key={`${index}-${camera.deviceId}`} value={camera.deviceId}>
-                          {camera.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div className="display-frame">
-                    {isNetworkSource(sourceId) ? (
-                      <canvas
-                        ref={(element) => {
-                          canvasRefs.current[index] = element
-                        }}
-                      ></canvas>
-                    ) : (
-                      <video
-                        ref={(element) => {
-                          videoRefs.current[index] = element
-                        }}
-                        autoPlay
-                        muted
-                        playsInline
-                      ></video>
-                    )}
-
-                    {tileLoading[index] && (
-                      <div className="tile-loader">
-                        <div className="spinner"></div>
-                        <div>Switching source...</div>
-                      </div>
-                    )}
-                  </div>
+        <div className="workspace">
+          <div className="multi-preview-grid">
+            {displaySources.map((sourceId, index) => (
+              <div className="display-card" key={`display-${index}`}>
+                <div className="display-head">
+                  <span>{`Display ${index + 1}`}</span>
                 </div>
-              ))}
-            </div>
 
-            <div className="av-devices">
-              <div style={{ display: 'flex', gap: 10, marginTop: '-5px', marginBottom: '10px' }}>
-                <input
-                  type="text"
-                  placeholder="rtsp://your-camera-url"
-                  value={rtspUrl}
-                  onChange={(e) => setRtspUrl(e.target.value)}
-                  style={{
-                    flex: 1,
-                    padding: 8,
-                    borderRadius: 4,
-                    background: '#333',
-                    color: '#fff',
-                    border: 'none'
-                  }}
-                />
-                <button
-                  onClick={handleAddRtsp}
-                  style={{
-                    padding: 8,
-                    borderRadius: 4,
-                    background: 'var(--ev-c-brand)',
-                    color: '#fff',
-                    border: 'none',
-                    cursor: 'pointer',
-                    fontWeight: 'bold'
-                  }}
-                >
-                  Add RTSP
-                </button>
+                <div className="display-frame">
+                  {isNetworkSource(sourceId) ? (
+                    <canvas
+                      ref={(element) => {
+                        canvasRefs.current[index] = element
+                      }}
+                    ></canvas>
+                  ) : (
+                    <video
+                      ref={(element) => {
+                        videoRefs.current[index] = element
+                      }}
+                      autoPlay
+                      muted
+                      playsInline
+                    ></video>
+                  )}
+
+                  {tileLoading[index] && (
+                    <div className="tile-loader">
+                      <div className="spinner"></div>
+                      <div>Switching source...</div>
+                    </div>
+                  )}
+                </div>
               </div>
+            ))}
+          </div>
+        </div>
 
-              <div style={{ display: 'flex', gap: 10, marginTop: '-5px', marginBottom: '10px' }}>
-                <input
-                  type="text"
-                  placeholder="rtmp://your-stream-url"
-                  value={rtmpUrl}
-                  onChange={(e) => setRtmpUrl(e.target.value)}
-                  style={{
-                    flex: 1,
-                    padding: 8,
-                    borderRadius: 4,
-                    background: '#333',
-                    color: '#fff',
-                    border: 'none'
-                  }}
-                />
-                <button
-                  onClick={handleAddRtmp}
-                  style={{
-                    padding: 8,
-                    borderRadius: 4,
-                    background: '#e44d26',
-                    color: '#fff',
-                    border: 'none',
-                    cursor: 'pointer',
-                    fontWeight: 'bold'
-                  }}
+        <div className="obs-bottom-bar">
+          <div className="source-select-row">
+            {displaySources.map((sourceId, index) => (
+              <div className="bottom-select-group" key={`source-select-${index}`}>
+                <label>{`Display ${index + 1}`}</label>
+                <select
+                  value={sourceId}
+                  onChange={(event) => handleDisplaySourceChange(index, event.target.value)}
                 >
-                  Add RTMP
-                </button>
-              </div>
-
-              <div className="device-select">
-                <label>Microphone:</label>
-                <select value={selectedMic} onChange={(e) => setSelectedMic(e.target.value)}>
-                  {mics.length === 0 && <option value="">Choose microphone</option>}
-                  {mics.map((mic) => (
-                    <option key={mic.deviceId} value={mic.deviceId}>
-                      {mic.label}
+                  {cameras.length === 0 && <option value="">Choose camera</option>}
+                  {cameras.map((camera) => (
+                    <option key={`${index}-${camera.deviceId}`} value={camera.deviceId}>
+                      {camera.label}
                     </option>
                   ))}
                 </select>
               </div>
+            ))}
+          </div>
 
+          <div className="obs-tools-row">
+            <div className="bottom-inline-form">
+              <input
+                type="text"
+                placeholder="rtsp://your-camera-url"
+                value={rtspUrl}
+                onChange={(e) => setRtspUrl(e.target.value)}
+              />
+              <button onClick={handleAddRtsp}>Add RTSP</button>
+            </div>
+
+            <div className="bottom-inline-form">
+              <input
+                type="text"
+                placeholder="rtmp://your-stream-url"
+                value={rtmpUrl}
+                onChange={(e) => setRtmpUrl(e.target.value)}
+              />
+              <button className="rtmp-btn" onClick={handleAddRtmp}>
+                Add RTMP
+              </button>
+            </div>
+          </div>
+
+          <div className="audio-controls-row">
+            <div className="bottom-select-group">
+              <label>Microphone</label>
+              <select value={selectedMic} onChange={(e) => setSelectedMic(e.target.value)}>
+                {mics.length === 0 && <option value="">Choose microphone</option>}
+                {mics.map((mic) => (
+                  <option key={mic.deviceId} value={mic.deviceId}>
+                    {mic.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="meter-group">
+              <label>Level</label>
               <meter ref={meterRef} high={0.35} max={1} value={0}></meter>
-              {isSwitchingAudio && <div style={{ fontSize: 12, opacity: 0.8 }}>Switching microphone...</div>}
-
-              <div className="device-select">
-                <label>Speaker:</label>
-                <select value={selectedSpeaker} onChange={(e) => setSelectedSpeaker(e.target.value)}>
-                  {speakers.length === 0 && <option value="">Choose speaker</option>}
-                  {speakers.map((speaker) => (
-                    <option key={speaker.deviceId} value={speaker.deviceId}>
-                      {speaker.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <audio ref={audioRef} controls loop title="local audio file">
-                  <source src={audioFile} type="audio/mp3" />
-                  This browser does not support the audio element.
-                </audio>
-              </div>
+              {isSwitchingAudio && <span>Switching microphone...</span>}
             </div>
-          </>
-        )}
+
+            <div className="bottom-select-group">
+              <label>Speaker</label>
+              <select value={selectedSpeaker} onChange={(e) => setSelectedSpeaker(e.target.value)}>
+                {speakers.length === 0 && <option value="">Choose speaker</option>}
+                {speakers.map((speaker) => (
+                  <option key={speaker.deviceId} value={speaker.deviceId}>
+                    {speaker.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="audio-player-group">
+              <audio ref={audioRef} controls loop title="local audio file">
+                <source src={audioFile} type="audio/mp3" />
+                This browser does not support the audio element.
+              </audio>
+            </div>
+          </div>
+        </div>
       </div>
-    </>
+    </div>
   )
 }
 
