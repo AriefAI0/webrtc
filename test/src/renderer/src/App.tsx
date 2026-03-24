@@ -11,6 +11,7 @@ import {
   isRtmpSource,
   isRtspSource,
   mergeVirtualAndHardwareCameras,
+  normalizeNetworkUrl,
   stopMediaStream,
   toVirtualCameraDevice,
   waitForSocketReady
@@ -494,33 +495,49 @@ function App(): React.JSX.Element {
   }
 
   const handleAddRtsp = () => {
-    if (!(rtspUrl && isRtspSource(rtspUrl))) {
+    const normalizedUrl = normalizeNetworkUrl(rtspUrl)
+    if (!(normalizedUrl && isRtspSource(normalizedUrl))) {
       alert('Please enter a valid RTSP URL starting with rtsp://')
       return
     }
 
-    const newRtspDevice = toVirtualCameraDevice(rtspUrl)
+    const newRtspDevice = toVirtualCameraDevice(normalizedUrl)
     setCameras((previous) => {
-      const next = [...previous, newRtspDevice]
-      return next.filter(
-        (camera, index, all) => all.findIndex((item) => item.deviceId === camera.deviceId) === index
-      )
+      if (previous.some((camera) => camera.deviceId === normalizedUrl)) {
+        return previous
+      }
+      return [...previous, newRtspDevice]
+    })
+    setDisplaySources((previous) => {
+      const next = [...previous]
+      const firstEmptyIndex = next.findIndex((sourceId) => !sourceId)
+      const targetIndex = firstEmptyIndex >= 0 ? firstEmptyIndex : 0
+      next[targetIndex] = normalizedUrl
+      return next
     })
     setRtspUrl('')
   }
 
   const handleAddRtmp = () => {
-    if (!(rtmpUrl && isRtmpSource(rtmpUrl))) {
+    const normalizedUrl = normalizeNetworkUrl(rtmpUrl)
+    if (!(normalizedUrl && isRtmpSource(normalizedUrl))) {
       alert('Please enter a valid RTMP URL starting with rtmp://')
       return
     }
 
-    const newRtmpDevice = toVirtualCameraDevice(rtmpUrl)
+    const newRtmpDevice = toVirtualCameraDevice(normalizedUrl)
     setCameras((previous) => {
-      const next = [...previous, newRtmpDevice]
-      return next.filter(
-        (camera, index, all) => all.findIndex((item) => item.deviceId === camera.deviceId) === index
-      )
+      if (previous.some((camera) => camera.deviceId === normalizedUrl)) {
+        return previous
+      }
+      return [...previous, newRtmpDevice]
+    })
+    setDisplaySources((previous) => {
+      const next = [...previous]
+      const firstEmptyIndex = next.findIndex((sourceId) => !sourceId)
+      const targetIndex = firstEmptyIndex >= 0 ? firstEmptyIndex : 0
+      next[targetIndex] = normalizedUrl
+      return next
     })
     setRtmpUrl('')
   }

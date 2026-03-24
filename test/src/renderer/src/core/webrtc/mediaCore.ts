@@ -10,14 +10,22 @@ export interface Device {
 const RTSP_PREFIX = 'rtsp://'
 const RTMP_PREFIX = 'rtmp://'
 
-export const isRtspSource = (deviceId: string): boolean => deviceId.startsWith(RTSP_PREFIX)
-export const isRtmpSource = (deviceId: string): boolean => deviceId.startsWith(RTMP_PREFIX)
+export const normalizeNetworkUrl = (value: string): string => value.trim()
+
+export const isRtspSource = (deviceId: string): boolean =>
+  normalizeNetworkUrl(deviceId).toLowerCase().startsWith(RTSP_PREFIX)
+export const isRtmpSource = (deviceId: string): boolean =>
+  normalizeNetworkUrl(deviceId).toLowerCase().startsWith(RTMP_PREFIX)
 export const isNetworkSource = (deviceId: string): boolean =>
   isRtspSource(deviceId) || isRtmpSource(deviceId)
 
 export const toVirtualCameraDevice = (url: string): Device => ({
-  deviceId: url,
-  label: `${isRtspSource(url) ? 'RTSP' : 'RTMP'}: ${url.substring(0, 20)}...`,
+  deviceId: normalizeNetworkUrl(url),
+  label: (() => {
+    const normalized = normalizeNetworkUrl(url)
+    const shortUrl = normalized.length > 48 ? `${normalized.substring(0, 48)}...` : normalized
+    return `${isRtspSource(url) ? 'RTSP' : 'RTMP'}: ${shortUrl}`
+  })(),
   kind: 'videoinput'
 })
 
